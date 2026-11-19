@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 一条受管的常驻端口转发：本机 18080 -> 对端 127.0.0.1:8080。
+     把 Label 加进 config.sh 的 TUNNEL_LABELS，link-manager 就会负责它的切换与回切。 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.example.tunnel-8080</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/ssh</string>
+    <string>-N</string>
+    <string>-o</string><string>BatchMode=yes</string>
+    <string>-o</string><string>ServerAliveInterval=15</string>
+    <string>-o</string><string>ServerAliveCountMax=3</string>
+    <string>-o</string><string>ExitOnForwardFailure=yes</string>
+    <string>-L</string><string>18080:127.0.0.1:8080</string>
+    <string>myhost</string>
+  </array>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+</dict>
+</plist>

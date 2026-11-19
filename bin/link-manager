@@ -1,0 +1,93 @@
+#!/bin/bash
+# link-manager：让常驻 ssh 隧道始终跑在当前最优链路上。由 launchd 周期触发 + 网络变化触发。
+#
+# 每轮：
+# 1. 用 link-endpoint 算出当前最优 IP（BEST）。
+# 2. 检查每个受管隧道当前所走的 IP（CUR）；CUR ≠ BEST 时结束该 ssh 进程，由 launchd 或外层循环重连。
+#    - CUR 已不可达（故障切换）：立即结束，不等 ServerAliveInterval 超时。
+#    - CUR 仍可达但 BEST 更优（回切）：BEST 须连续 FAILBACK_ROUNDS 轮不变才动作，防止链路抖动来回切。
+#    未列入配置的 ssh 进程（例如交互式会话）一律不动。
+# 3. 若配置了 REFRESH_LABEL，且该候选不通而别的链路通，经 ssh 读回对端新 IP 写入缓存。
+#
+# 只在发生动作时写日志。
+
+set -uo pipefail
+
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENDPOINT="$BIN_DIR/link-endpoint"
+CONFIG="${SSH_LINK_FAILOVER_CONFIG:-$HOME/.config/ssh-link-failover/config.sh}"
+STATE_DIR="${SSH_LINK_FAILOVER_STATE:-$HOME/.cache/ssh-link-failover}"
+LOG="${SSH_LINK_FAILOVER_LOG:-$HOME/Library/Logs/ssh-link-failover.log}"
+[ -r "$CONFIG" ] || { echo "link-manager: 找不到配置 $CONFIG" >&2; exit 2; }
+# shellcheck source=/dev/null
+source "$CONFIG"
+PORT="${PORT:-22}"
+PROBE_TIMEOUT="${PROBE_TIMEOUT:-2}"
+FAILBACK_ROUNDS="${FAILBACK_ROUNDS:-2}"
+REFRESH_INTERVAL="${REFRESH_INTERVAL:-600}"
+DRY_RUN="${DRY_RUN:-0}"
+mkdir -p "$STATE_DIR" "$(dirname "$LOG")"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
+reachable() { nc -z -G "$PROBE_TIMEOUT" -w "$PROBE_TIMEOUT" "$1" "$PORT" >/dev/null 2>&1; }
+
+# ---- 1. 当前最优链路与它已持续的轮数 ----
+BEST="$("$ENDPOINT" 2>/dev/null)" || { echo "none 0" > "$STATE_DIR/best"; exit 0; }
+PREV=""; ROUNDS=0
+[ -r "$STATE_DIR/best" ] && read -r PREV ROUNDS < "$STATE_DIR/best"
+[[ "$ROUNDS" =~ ^[0-9]+$ ]] || ROUNDS=0
+if [ "$BEST" = "$PREV" ]; then ROUNDS=$((ROUNDS + 1)); else ROUNDS=1; log "best ${PREV:-?} -> $BEST"; fi
+echo "$BEST $ROUNDS" > "$STATE_DIR/best"
+
+# ---- 2. 逐个检查受管隧道 ----
+stop_tunnel() {  # $1=pid $2=说明
+  if [ "$DRY_RUN" = "1" ]; then log "[dry-run] would kill pid=$1: $2"; else log "kill pid=$1: $2"; kill "$1" 2>/dev/null; fi
+}
+
+check() {  # $1=pid $2=当前 IP $3=名称
+  local pid="$1" cur="$2" name="$3"
+  if [ -z "$cur" ] || [ "$cur" = "$BEST" ]; then return 0; fi
+  if ! reachable "$cur"; then
+    stop_tunnel "$pid" "$name on $cur unreachable, failover to $BEST"
+  elif [ "$ROUNDS" -ge "$FAILBACK_ROUNDS" ]; then
+    stop_tunnel "$pid" "$name on $cur, better link $BEST stable for $ROUNDS rounds, failback"
+  fi
+}
+
+# launchd 托管的 ssh：ProxyCommand 形如 sh -c '... exec nc IP PORT'，exec 后 nc 是 ssh 的直接子进程
+for label in "${TUNNEL_LABELS[@]+"${TUNNEL_LABELS[@]}"}"; do
+  pid="$(launchctl list | awk -v l="$label" '$3==l && $1 ~ /^[0-9]+$/ {print $1}')"
+  [ -n "$pid" ] || continue
+  ncpid="$(pgrep -P "$pid" -x nc 2>/dev/null | head -n1)"
+  [ -n "$ncpid" ] || continue
+  cur="$(ps -o command= -p "$ncpid" | awk '{print $2}')"
+  check "$pid" "$cur" "$label"
+done
+
+# 目标 IP 直接写在参数里的转发进程（如 -R 127.0.0.1:2222:<IP>:22）
+for prefix in "${FORWARD_PREFIXES[@]+"${FORWARD_PREFIXES[@]}"}"; do
+  for pid in $(pgrep -f -- "$prefix" 2>/dev/null); do
+    [ "$(ps -o comm= -p "$pid" | xargs basename 2>/dev/null)" = "ssh" ] || continue
+    cur="$(ps -o command= -p "$pid" | grep -oE -- "${prefix//./\\.}[0-9.]+" | head -n1)"
+    cur="${cur#"$prefix"}"
+    check "$pid" "$cur" "forward[$prefix]"
+  done
+done
+
+# ---- 3. 动态 IP 刷新 ----
+if [ -n "${REFRESH_LABEL:-}" ] && [ -n "${REFRESH_CMD:-}" ]; then
+  ip="$("$ENDPOINT" --list | awk -v l="$REFRESH_LABEL" '$2==l {print $1}')"
+  stamp="$STATE_DIR/refresh_checked"
+  if [ -n "$ip" ] && [ "$BEST" != "$ip" ] && ! reachable "$ip"; then
+    last=$(stat -f %m "$stamp" 2>/dev/null || echo 0)
+    if [ $(( $(date +%s) - last )) -ge "$REFRESH_INTERVAL" ]; then
+      touch "$stamp"
+      new="$(/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=8 "$SSH_ALIAS" "$REFRESH_CMD" 2>/dev/null | tr -d '\r[:space:]')"
+      if [[ "$new" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && [ "$new" != "$ip" ]; then
+        echo "$new" > "$STATE_DIR/ip_$REFRESH_LABEL"
+        log "$REFRESH_LABEL ip $ip -> $new (cached)"
+      fi
+    fi
+  fi
+fi
+exit 0
